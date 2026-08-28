@@ -395,6 +395,8 @@ extern "C" {
         ggml_abort_callback abort_callback;
         void *              abort_callback_data;
 
+        size_t n_expert_cache_bytes; // byte budget for the device-side LRU cache of offloaded MoE expert weights, 0 = disabled
+
         // Keep the booleans together and at the end of the struct to avoid misalignment during copy-by-value.
         bool embeddings;  // if true, extract embeddings (together with logits)
         bool offload_kqv; // offload the KQV ops (including the KV cache) to GPU

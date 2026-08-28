@@ -10,6 +10,7 @@
 
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
+#include "ggml-backend-expert-cache.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
 
@@ -822,6 +823,9 @@ struct ggml_backend_sched {
 
     bool op_offload;
 
+    // persistent LRU cache for offloaded MoE expert weights, NULL = disabled
+    ggml_backend_expert_cache * expert_cache;
+
     int debug;
 
     // used for debugging graph reallocations [GGML_SCHED_DEBUG_REALLOC]
@@ -1597,6 +1601,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
+    // the first eval discovers all offloaded expert tensors, build the pools afterwards
+    ggml_backend_expert_cache_size(sched->expert_cache);
+
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
@@ -1642,10 +1649,22 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
                 ggml_tensor * node = split->graph.nodes[0];
+
+                // the node inputs may still point into the expert cache of a previous eval
+                // when the graph was reused, in which case the cache lookup is keyed by the pool
+                ggml_backend_expert_cache_entry * entry =
+                    ggml_backend_expert_cache_entry_get(sched->expert_cache, split_backend, input);
+
+                if (entry != NULL && node->src[0] != input_cpy &&
+                        ggml_backend_expert_cache_entry_find(sched->expert_cache, split_backend, node->src[0]) != entry) {
+                    entry = NULL; // the node consumes a different expert pool
+                }
+
                 if (split->graph.n_nodes > 0 &&
                     ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
                     ggml_backend_buffer_is_host(input->buffer) && (
                     (node->src[0] == input_cpy && node->op == GGML_OP_MUL_MAT_ID)
+                    || entry != NULL
                     //|| (node->src[1] == input_cpy && node->op == GGML_OP_ADD_ID) /* GGML_OP_ADD_ID weights are small and not worth splitting */
                     )) {
 
@@ -1658,13 +1677,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     ggml_tensor * ids_tensor = node->src[2];
                     ggml_backend_t ids_backend = split_backend;
 
-                    // if the ids tensor is also an input of the split, it may not have been copied yet to the split backend
-                    // in that case, we use the original ids tensor
-                    for (int i = input_id + 1; i < split->n_inputs; i++) {
-                        if (ids_tensor == tensor_copy(split->inputs[i], split_backend_id, sched->cur_copy)) {
-                            ids_tensor = split->inputs[i];
-                            ids_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[i]);
-                            break;
+                    if (entry != NULL && entry->ids_orig != NULL) {
+                        // the node's src[2] is rewired to the slot remapped ids of the cache,
+                        // read the raw ids from where they were first observed instead
+                        ids_tensor = entry->ids_orig;
+                        ids_backend = entry->ids_orig_backend;
+                    } else {
+                        // if the ids tensor is also an input of the split, it may not have been copied yet to the split backend
+                        // in that case, we use the original ids tensor
+                        for (int i = input_id + 1; i < split->n_inputs; i++) {
+                            if (ids_tensor == tensor_copy(split->inputs[i], split_backend_id, sched->cur_copy)) {
+                                ids_tensor = split->inputs[i];
+                                ids_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[i]);
+                                break;
+                            }
                         }
                     }
 
@@ -1687,44 +1713,77 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         prev_ids_tensor = ids_tensor;
                     }
 
-                    // group consecutive experts and copy them together
-                    auto copy_experts = [&](int32_t first_id, int32_t last_id) {
-                        const size_t expert_offset = first_id * expert_size;
-                        const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
-                        const size_t padding = std::min<size_t>(expert_size, 512);
-                        const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
+                    bool cached = false;
 
-                        ggml_backend_tensor_set_async(split_backend,
-                            input_cpy,
-                            (const uint8_t *)input->data + expert_offset, expert_offset,
-                            // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
-                            // this is necessary for MMQ in the CUDA backend
-                            expert_size_copy + padding_end);
-                    };
+                    if (entry != NULL &&
+                            ids_tensor->type == GGML_TYPE_I32 &&
+                            ids_tensor->nb[0] == (int64_t) sizeof(int32_t) &&
+                            ids_tensor->nb[1] == ids_tensor->ne[0] * (int64_t) sizeof(int32_t) &&
+                            ggml_backend_expert_cache_prepare(sched->expert_cache, entry, split_backend, ids.data(), ids_tensor->ne[0], ids_tensor->ne[1])) {
 
-                    int id = 0;
-                    while (!ggml_bitset_get(used_ids.data(), id)) {
-                        id++;
+                        ggml_tensor * ids_view = ggml_backend_expert_cache_ids_view(
+                                sched->expert_cache, entry, split_backend, ids.data(), ids_tensor->ne[0], ids_tensor->ne[1]);
+
+                        if (ids_view != NULL) {
+                            if (entry->ids_cpy == NULL) {
+                                entry->ids_cpy  = node->src[2];
+                                entry->ids_orig = ids_tensor;
+                                entry->ids_orig_backend = ids_backend;
+                            }
+
+                            node->src[0] = entry->pool;
+                            node->src[2] = ids_view;
+
+                            cached = true;
+                        }
                     }
-                    int32_t first_id = id;
-                    int32_t last_id = first_id;
 
-                    for (++id; id < n_expert; ++id) {
-                        if (!ggml_bitset_get(used_ids.data(), id)) {
-                            continue;
+                    if (!cached) {
+                        // restore inputs that may point into the expert cache of a previous eval
+                        node->src[0] = input_cpy;
+                        if (entry != NULL && entry->ids_cpy != NULL) {
+                            node->src[2] = entry->ids_cpy;
                         }
 
-                        if (id == last_id + 1) {
+                        // group consecutive experts and copy them together
+                        auto copy_experts = [&](int32_t first_id, int32_t last_id) {
+                            const size_t expert_offset = first_id * expert_size;
+                            const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
+                            const size_t padding = std::min<size_t>(expert_size, 512);
+                            const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
+
+                            ggml_backend_tensor_set_async(split_backend,
+                                input_cpy,
+                                (const uint8_t *)input->data + expert_offset, expert_offset,
+                                // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
+                                // this is necessary for MMQ in the CUDA backend
+                                expert_size_copy + padding_end);
+                        };
+
+                        int id = 0;
+                        while (!ggml_bitset_get(used_ids.data(), id)) {
+                            id++;
+                        }
+                        int32_t first_id = id;
+                        int32_t last_id = first_id;
+
+                        for (++id; id < n_expert; ++id) {
+                            if (!ggml_bitset_get(used_ids.data(), id)) {
+                                continue;
+                            }
+
+                            if (id == last_id + 1) {
+                                last_id = id;
+                                continue;
+                            }
+
+                            copy_experts(first_id, last_id);
+
+                            first_id = id;
                             last_id = id;
-                            continue;
                         }
-
                         copy_experts(first_id, last_id);
-
-                        first_id = id;
-                        last_id = id;
                     }
-                    copy_experts(first_id, last_id);
                 } else {
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
@@ -1886,6 +1945,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched->leaf_backend_ids);
     free(sched->prev_node_backend_ids);
     free(sched->prev_leaf_backend_ids);
+    ggml_backend_expert_cache_free(sched->expert_cache);
     free(sched->context_buffer);
     free(sched->graph.nodes);
     free(sched->graph.leafs);
@@ -1902,6 +1962,9 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
         sched->is_reset = true;
     }
     sched->is_alloc = false;
+
+    // the graph is about to be rebuilt, cached node input pointers become stale
+    ggml_backend_expert_cache_invalidate(sched->expert_cache);
 }
 
 void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes) {
@@ -1992,6 +2055,25 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_eval = callback;
     sched->callback_eval_user_data = user_data;
+}
+
+void ggml_backend_sched_set_expert_cache_size(ggml_backend_sched_t sched, size_t size) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT(!sched->is_alloc);
+
+    ggml_backend_expert_cache_free(sched->expert_cache);
+    sched->expert_cache = NULL;
+
+    if (size == 0) {
+        return;
+    }
+
+    if (sched->n_copies > 1) {
+        GGML_LOG_WARN("%s: expert cache is not supported with pipeline parallelism, ignoring\n", __func__);
+        return;
+    }
+
+    sched->expert_cache = ggml_backend_expert_cache_create(size);
 }
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {

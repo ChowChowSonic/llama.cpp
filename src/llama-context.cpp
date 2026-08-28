@@ -271,6 +271,7 @@ llama_context::llama_context(
 
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
+    cparams.n_expert_cache_bytes = params.n_expert_cache_bytes;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -602,6 +603,7 @@ void llama_context::sched_reserve() {
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    ggml_backend_sched_set_expert_cache_size(sched.get(), cparams.n_expert_cache_bytes);
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -637,6 +639,7 @@ void llama_context::sched_reserve() {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+                ggml_backend_sched_set_expert_cache_size(sched.get(), cparams.n_expert_cache_bytes);
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -3619,6 +3622,7 @@ llama_context_params llama_context_default_params() {
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
+        /*.n_expert_cache_bytes        =*/ 0,
         /*.embeddings                  =*/ false,
         /*.offload_kqv                 =*/ true,
         /*.no_perf                     =*/ true,

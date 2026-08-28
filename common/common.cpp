@@ -1746,6 +1746,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.offload_kqv       = !params.no_kv_offload;
     cparams.no_perf           = params.no_perf;
     cparams.op_offload        = !params.no_op_offload;
+    cparams.n_expert_cache_bytes = (size_t) params.expert_cache_size * 1024 * 1024;
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
 

@@ -187,6 +187,27 @@ struct common_chat_msg_spans {
         }
         return -1;
     }
+
+    // agent harnesses edit context at tool-call boundaries; treat user and tool
+    // message starts as checkpoint anchors
+    bool is_anchor_start(int32_t pos) const {
+        for (auto it = spans.begin(); it != spans.end(); ++it) {
+            if ((it->role == COMMON_CHAT_ROLE_USER || it->role == COMMON_CHAT_ROLE_TOOL)
+                    && pos == (int32_t) it->pos) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    int32_t last_anchor_pos() const {
+        for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
+            if (it->role == COMMON_CHAT_ROLE_USER || it->role == COMMON_CHAT_ROLE_TOOL) {
+                return (int32_t) it->pos;
+            }
+        }
+        return -1;
+    }
 };
 
 struct common_chat_msg_delimiter {

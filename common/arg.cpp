@@ -2806,6 +2806,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             llm_add_n_cpu_ffn_overrides(value, LLM_FFN_DENSE_REGEX, params.tensor_buft_overrides);
         }
     ).set_env("LLAMA_ARG_N_CPU_FFN"));
+    add_opt(common_arg(
+        {"--expert-cache-size"}, "N",
+        string_format("device-side LRU cache size in MiB for offloaded MoE expert weights, 0 = disabled (default: %d)", params.expert_cache_size),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.expert_cache_size = value;
+        }
+    ).set_env("LLAMA_ARG_EXPERT_CACHE_SIZE"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",

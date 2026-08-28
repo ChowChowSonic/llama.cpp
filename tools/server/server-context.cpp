@@ -3491,7 +3491,7 @@ private:
                     }
 
                     const auto & spans = slot.task->params.message_spans;
-                    const auto last_user_pos = spans.last_user_message_pos();
+                    const auto last_anchor = spans.last_anchor_pos();
 
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
@@ -3519,12 +3519,12 @@ private:
                             /* is_prompt = */ true);
                         slot.prompt.tokens.push_back(cur_tok);
 
-                        // break at the last user message, or at user messages at least min step past the last checkpoint
-                        if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
+                        // break at the last anchor, or at anchors at least min step past the last checkpoint
+                        if (do_checkpoint && spans.is_anchor_start(slot.prompt.n_tokens())) {
                             const auto pos = slot.prompt.n_tokens();
                             const auto & checkpoints = slot.prompt.checkpoints;
 
-                            if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
+                            if (pos == last_anchor || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
                                 break;
                             }
                         }
@@ -3558,8 +3558,8 @@ private:
 
                     const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
 
-                    const bool is_user_start = spans.is_user_start(n_tokens_start);
-                    const bool is_last_user_message = n_tokens_start == last_user_pos;
+                    const bool is_anchor = spans.is_anchor_start(n_tokens_start);
+                    const bool is_last_anchor = n_tokens_start == last_anchor;
 
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
@@ -3575,9 +3575,9 @@ private:
 
                         slot.init_sampler();
                     } else {
-                        // skip ordinary mid-prompt checkpoints, unless the batch starts a user
-                        // message or we are near the end of the prompt
-                        if (!is_user_start && !near_prompt_end) {
+                        // skip ordinary mid-prompt checkpoints, unless the batch starts an anchor
+                        // (user or tool message) or we are near the end of the prompt
+                        if (!is_anchor && !near_prompt_end) {
                             do_checkpoint = false;
                         }
                     }
@@ -3594,10 +3594,10 @@ private:
                     // do not checkpoint after mtmd chunks
                     do_checkpoint = do_checkpoint && !has_mtmd;
 
-                    // no need to create checkpoints that are too close together, unless it's the last user message
+                    // no need to create checkpoints that are too close together, unless it's the last anchor
                     do_checkpoint = do_checkpoint && (
                             slot.prompt.checkpoints.empty() ||
-                            is_last_user_message || near_prompt_end ||
+                            is_last_anchor || near_prompt_end ||
                             n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 

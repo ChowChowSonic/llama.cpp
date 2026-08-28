@@ -353,6 +353,11 @@ extern "C" {
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
 
+    // Enable a persistent LRU cache for offloaded MoE expert weights with the given size in
+    // bytes (0 = disabled). Expert weights stay host-resident, missing experts are staged
+    // into device slots and reused across evals. Must be called before the first compute
+    GGML_API void                 ggml_backend_sched_set_expert_cache_size(ggml_backend_sched_t sched, size_t size);
+
     //
     // Meta backend
     //

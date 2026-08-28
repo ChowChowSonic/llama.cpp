@@ -54,6 +54,8 @@ struct llama_cparams {
     bool kv_unified;
     bool pipeline_parallel;
 
+    size_t n_expert_cache_bytes; // byte budget for the device-side LRU cache of offloaded MoE expert weights, 0 = disabled
+
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 
     enum llama_context_type ctx_type;
