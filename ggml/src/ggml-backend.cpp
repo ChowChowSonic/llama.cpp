@@ -1653,7 +1653,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 // the node inputs may still point into the expert cache of a previous eval
                 // when the graph was reused, in which case the cache lookup is keyed by the pool
                 ggml_backend_expert_cache_entry * entry =
-                    ggml_backend_expert_cache_entry_get(sched->expert_cache, split_backend, input);
+                    ggml_backend_expert_cache_entry_find_w(sched->expert_cache, split_backend, input);
 
                 if (entry != NULL && node->src[0] != input_cpy &&
                         ggml_backend_expert_cache_entry_find(sched->expert_cache, split_backend, node->src[0]) != entry) {
@@ -1667,6 +1667,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     || entry != NULL
                     //|| (node->src[1] == input_cpy && node->op == GGML_OP_ADD_ID) /* GGML_OP_ADD_ID weights are small and not worth splitting */
                     )) {
+
+                    // only genuine MUL_MAT_ID weight stacks may join a group
+                    if (entry == NULL && node->src[0] == input_cpy && node->op == GGML_OP_MUL_MAT_ID) {
+                        entry = ggml_backend_expert_cache_entry_get(sched->expert_cache, split_backend, input);
+                    }
 
                     const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
                     const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];

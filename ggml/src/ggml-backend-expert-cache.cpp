@@ -164,6 +164,21 @@ void ggml_backend_expert_cache_invalidate(ggml_backend_expert_cache * cache) {
     }
 }
 
+ggml_backend_expert_cache_entry * ggml_backend_expert_cache_entry_find_w(
+        ggml_backend_expert_cache * cache, ggml_backend_t backend, ggml_tensor * w) {
+    if (cache == NULL || cache->disabled) {
+        return NULL;
+    }
+
+    for (auto * entry : cache->entries) {
+        if (entry->w == w && entry->backend == backend) {
+            return entry;
+        }
+    }
+
+    return NULL;
+}
+
 ggml_backend_expert_cache_entry * ggml_backend_expert_cache_entry_get(
         ggml_backend_expert_cache * cache, ggml_backend_t backend, ggml_tensor * w) {
     if (cache == NULL || cache->disabled) {

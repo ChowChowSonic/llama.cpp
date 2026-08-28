@@ -98,6 +98,10 @@ void ggml_backend_expert_cache_invalidate(ggml_backend_expert_cache * cache);
 ggml_backend_expert_cache_entry * ggml_backend_expert_cache_entry_get(
         ggml_backend_expert_cache * cache, ggml_backend_t backend, ggml_tensor * w);
 
+// existing entry for (backend, w), without registering new groups or entries
+ggml_backend_expert_cache_entry * ggml_backend_expert_cache_entry_find_w(
+        ggml_backend_expert_cache * cache, ggml_backend_t backend, ggml_tensor * w);
+
 // entry owning the pool tensor t, or NULL. used to recognize reused graphs where the node
 // src still points at the pool
 ggml_backend_expert_cache_entry * ggml_backend_expert_cache_entry_find(

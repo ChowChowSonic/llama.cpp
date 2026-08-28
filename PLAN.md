@@ -324,12 +324,92 @@ Read this before touching anything below.
 - `ggml/src/ggml-vulkan/ggml-vulkan.cpp` carries the user's own large
   pre-existing changes. Never reformat or regenerate that file; read it
   carefully before editing and keep edits surgical.
-- Build is clean. User has manually smoke-tested the cache path and it
-  works. The automated greedy-parity run (cache 0 vs cache N) had not
-  completed; run it before trusting numerical claims.
+- Build is clean. Cache path smoke-tested by user and now verified
+  automatically (see Phase 1 progress below).
 - Cache enable line at runtime: look for `expert cache: N slots/layer` in
   stderr from GGML_LOG_INFO; warnings on that prefix indicate fallback to
-  the legacy per-ubatch copy path.
+  the legacy per-ubatch copy path. NOTE: llama-cli/llama-server suppress
+  GGML INFO logs unless run with `-v`; without it the enable line is
+  invisible even when the cache is on.
+
+### Phase 1 progress (verified)
+- CRASH FIXED (real bug, not just the user's accidental second instance):
+  `ggml_backend_expert_cache_entry_get` was called for every split input in
+  `ggml_backend_sched_compute_splits`, and it registered any tensor (e.g.
+  the `ffn_moe_topk` ids tensor, ne [10,2,1] nb2=4096) as an expert-stack
+  group. The bogus group (n_expert = ids->ne[2] = 1) forced global
+  n_slots = 1 and its pool memset OOB'd (`tensor write out of bounds` at
+  ggml-backend.cpp:411 during the load-time `common_context_can_seq_rm`
+  probe). Fix: new lookup-only
+  `ggml_backend_expert_cache_entry_find_w()` used at the call site;
+  registration now happens inside the block only for genuine
+  MUL_MAT_ID host-weight inputs (`node->src[0] == input_cpy`). Files:
+  `ggml/src/ggml-backend-expert-cache.{h,cpp}`, `ggml/src/ggml-backend.cpp`.
+- KEY ENVIRONMENT GOTCHA: by default MUL_MAT_ID is placed on the CPU
+  backend (host weights), so the expert stacks never cross a split and the
+  cache never engages. Vulkan only claims host-weight ops when
+  `ggml_vk_get_op_batch_size(op) >= GGML_OP_OFFLOAD_MIN_BATCH` (default
+  32, ggml-vulkan.cpp ~19178/19338), so without the override the cache is
+  prefill-only. All cache testing MUST set `GGML_OP_OFFLOAD_MIN_BATCH=1`
+  to get decode-path engagement.
+- Greedy parity PASSED: same prompt/seed/temp 0, `-cmoe -ngl 99
+  --no-jinja`, GGML_OP_OFFLOAD_MIN_BATCH=1, `--expert-cache-size 0` vs
+  `8192`: generated text byte-identical (only the t/s line differs).
+- Cache enable confirmed with `-v`: `expert cache: 95 slots/layer,
+  144 tensors, 8154.8 MiB` (48 layers x 3 stacks, 512 experts/layer),
+  no warnings. Server on port 8090 also shows it.
+- Throughput data points (tiny prompt, 64 tokens): CPU-MoE default
+  placement decoded ~13 t/s; Vulkan MoE with legacy per-ubatch copies
+  (cache 0, env=1) ~3.5 t/s; cache 8192 with env=1 ~3.5 t/s on the first
+  short request (cold cache, no warmup budget). Decode win needs a longer
+  generation to measure warm hit rate - open question for Phase 2.
+- Model facts: qwen4exp GGUF (Qwen3.8-Flash-Next UD-Q2_K_XL) has 3 shards,
+  experts live in shards 2-3; 48 MoE layers, 512 routed experts/layer,
+  gate/up [2560,640,512] + down [640,2560,512], separate (not fused)
+  gate/up tensors, shared expert per layer.
+- Server multi-turn checkpoint-restore test PASSED (cache 8192 active,
+  `-cmoe -ngl 99 -c 8192 --temp 0 -s 42 -v`, env above, requests via
+  `curl -d @file.json`):
+  req1 804-token prompt -> 3 checkpoints created (pos 46 anchor, 287, 799
+  via the 4+n_ubatch / 4 offsets). req2 extends history -> restored
+  checkpoint 799, cached 800/837, 9 s wall. req3 edits a word ~token 350
+  (after a checkpoint was erased by the min-spacing rule) -> log shows
+  the reverse-order checkpoint scan and `restored context checkpoint
+  (pos_min = 46, ...)`, 761/808 tokens re-prefilled at 43 t/s instead of
+  a full reset, decode 3.2 t/s, `graphs reused = 19`.
+  Note: checkpoints are erased when closer than `checkpoint_min_step`
+  (here spacing 8192 -> only anchor/last survive), so deep restores can
+  degenerate to the first anchor. Relevant to item 8 gap (c).
+- Phase 1 gate result: Tier-0 stack verified end-to-end. Two follow-ups
+  carried into Phase 2: warm hit-rate throughput win is unmeasured, and
+  the checkpoint min-spacing/selection behavior above.
+- Execution agreement: phase-by-phase with user gates. Approved choices:
+  item 3 validated by practical equivalence (byte-exact only when the q*
+  split path is inactive; identical greedy tokens + small logit tolerance
+  when active); item 19 implemented as persistent template state blob
+  (full `llama_state_seq` prefill-once, load per matching request), NOT
+  KV row sharing. Agreed order: verify Tier 0 -> item 3 -> item 8 -> 19
+  -> 6 -> 16.
+
+### Key code findings for Phase 2/3 (from exploration)
+- Item 3 integration point: the fallback branch at
+  `ggml_backend.cpp` (the `if (!cached)` block after
+  `ggml_backend_expert_cache_prepare` returns false, ~line 1750).
+  Bandwidth probes belong in `ggml_backend_expert_cache_size`. CPU branch
+  cannot insert graph nodes post-allocation; plan is: read activation x
+  from device (small during decode), run MUL_MAT_ID via a micro-graph on
+  the CPU backend against the host stack, merge partial on device.
+- Item 8: `state_seq` save/load ALREADY covers GDN S-states, conv rows
+  and PLE conv history (`llama-memory-recurrent.cpp` state_write_data);
+  server checkpoints use PARTIAL_ONLY which for hybrid_idx saves only the
+  recurrent part (KV + indexer KV re-derived after restore). Real gaps:
+  (a) `LLM_ARCH_QWEN4EXP` missing from `llm_arch_supports_rs_rollback`
+  (src/llama-arch.cpp ~1099) so n_rs_seq = 0; (b) restore/seq_rm ordering
+  on hybrid memory; (c) deepest-surviving-anchor checkpoint selection.
+- Item 19: template blob = a never-evicted checkpoint with pos_min==0;
+  server checkpoint store is `common_prompt_checkpoint`
+  (common/common.cpp update_tgt/dft via llama_state_seq_get_data_ext).
+  Server restore/search logic at server-context.cpp ~3322-3358.
 
 ### Expert cache design invariants (violating any of these breaks it)
 - Host expert weights are the source of truth; device slot pools are pure
